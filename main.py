@@ -6,16 +6,14 @@ from io import BytesIO
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
-
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 # -----------------------------
-# Gemini Client
+# AI Pipe Client (OpenAI Compatible)
 # -----------------------------
-client = genai.Client(
-    api_key=os.environ["GEMINI_API_KEY"]
+client = OpenAI(
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openrouter/v1"
 )
 
 # -----------------------------
@@ -66,14 +64,11 @@ def clean_answer(text: str) -> str:
     return text.strip()
 
 
-def decode_image(image_base64: str):
-
+def format_base64_image(image_base64: str) -> str:
+    # Strip any existing data URI header prefix so we can standardize it
     if "," in image_base64:
         image_base64 = image_base64.split(",", 1)[1]
-
-    image_bytes = base64.b64decode(image_base64)
-
-    return Image.open(BytesIO(image_bytes))
+    return f"data:image/jpeg;base64,{image_base64.strip()}"
 
 
 # -----------------------------
@@ -91,8 +86,8 @@ def home():
 def answer_image(req: ImageRequest):
 
     try:
-
-        image = decode_image(req.image_base64)
+        # Prepare the standard base64 data URL for OpenAI/AI Pipe integration
+        image_url = format_base64_image(req.image_base64)
 
         prompt = f"""
 You are an expert OCR and visual reasoning model.
@@ -115,18 +110,21 @@ IMPORTANT RULES
 9. Keep dates exactly as shown unless asked otherwise.
 """
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                prompt,
-                image
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0
-            )
+        response = client.chat.completions.create(
+            model="google/gemini-2.5-flash",
+            temperature=0,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                }
+            ]
         )
 
-        answer = clean_answer(response.text)
+        answer = clean_answer(response.choices[0].message.content)
 
         return ImageResponse(answer=answer)
 
