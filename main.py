@@ -1,11 +1,12 @@
 import os
 import re
+import requests
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 
-app = FastAPI(title="Multimodal Image QA API")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,10 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(
-    base_url=os.environ["ANTHROPIC_BASE_URL"],
-    api_key=os.environ["ANTHROPIC_AUTH_TOKEN"],
-)
+API_KEY = os.environ["ANTHROPIC_AUTH_TOKEN"]
+BASE_URL = os.environ["ANTHROPIC_BASE_URL"].rstrip("/")
 
 
 class ImageRequest(BaseModel):
@@ -30,92 +29,88 @@ class ImageResponse(BaseModel):
     answer: str
 
 
-def clean_answer(ans: str) -> str:
-    ans = ans.strip()
+def clean_answer(text: str) -> str:
+    if text is None:
+        return ""
 
-    # remove markdown code fences
-    ans = re.sub(r"^```.*?\n", "", ans, flags=re.DOTALL)
-    ans = ans.replace("```", "")
+    text = text.strip()
 
-    # remove surrounding quotes
-    ans = ans.strip("\"'")
-    return ans.strip()
+    text = re.sub(r"^```.*?\n", "", text, flags=re.DOTALL)
+    text = text.replace("```", "")
+
+    return text.strip("\"' ").strip()
 
 
 @app.get("/")
-def home():
-    return {"status": "running"}
+def root():
+    return {"status": "ok"}
 
 
 @app.post("/answer-image", response_model=ImageResponse)
-def answer_image(req: ImageRequest):
+def answer(req: ImageRequest):
 
-    try:
+    image = req.image_base64.strip()
 
-        image_data = req.image_base64.strip()
+    if not image.startswith("data:image"):
+        image = "data:image/png;base64," + image
 
-        # add prefix if grader sends only raw base64
-        if not image_data.startswith("data:image"):
-            image_data = "data:image/png;base64," + image_data
-
-        prompt = f"""
-You are an OCR and visual reasoning assistant.
-
+    payload = {
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "temperature": 0,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"""
 Answer ONLY the user's question.
 
 Question:
 {req.question}
 
 Rules:
-
-- Return ONLY the answer.
+- Return only the answer.
 - No explanation.
-- No sentences.
-- If numeric, return ONLY the number.
-- No commas unless present in the answer.
+- If numeric, return only the number.
 - No currency symbols.
 - No units.
 - No markdown.
 """
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image
+                        }
+                    }
+                ]
+            }
+        ]
+    }
 
-        completion = client.chat.completions.create(
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+    r = requests.post(
+        f"{BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
 
-            temperature=0,
+    # This is the important part.
+    # If Groq rejects the request you'll actually see WHY.
+    if r.status_code != 200:
+        print(r.status_code)
+        print(r.text)
+        raise HTTPException(r.status_code, r.text)
 
-            max_completion_tokens=128,
+    data = r.json()
 
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
+    answer = data["choices"][0]["message"]["content"]
 
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_data
-                            },
-                        },
-                    ],
-                }
-            ],
-        )
-
-        answer = completion.choices[0].message.content
-
-        if answer is None:
-            answer = ""
-
-        answer = clean_answer(answer)
-
-        return ImageResponse(answer=answer)
-
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+    return ImageResponse(answer=clean_answer(answer))
