@@ -1,12 +1,11 @@
 import os
-import json
-from typing import Optional, Any
-from fastapi import FastAPI, HTTPException, Request
+import re
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from openai import OpenAI
 
-app = FastAPI()
+app = FastAPI(title="Multimodal Image QA API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,79 +16,106 @@ app.add_middleware(
 )
 
 client = OpenAI(
-    base_url=os.environ.get("ANTHROPIC_BASE_URL"),
-    api_key=os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    base_url=os.environ["ANTHROPIC_BASE_URL"],
+    api_key=os.environ["ANTHROPIC_AUTH_TOKEN"],
 )
 
-# 1. The inner structured data format required by the prompt
-class InvoiceData(BaseModel):
-    invoice_no: Optional[str] = Field(None, description="The invoice number/ID. Null if not found.")
-    date: Optional[str] = Field(None, description="The invoice date formatted strictly as YYYY-MM-DD. Null if not found.")
-    vendor: Optional[str] = Field(None, description="The name of the vendor/seller. Null if not found.")
-    amount: Optional[float] = Field(None, description="The subtotal amount BEFORE tax. Null if not found.")
-    tax: Optional[float] = Field(None, description="The tax amount only. Null if not found.")
-    currency: Optional[str] = Field(None, description="The 3-letter currency code (e.g., INR, USD). Null if not found.")
 
-# 2. The top-level wrapper required by the grader ("Response JSON must include an 'answer' field")
-class GraderResponse(BaseModel):
-    answer: InvoiceData
+class ImageRequest(BaseModel):
+    image_base64: str
+    question: str
 
-@app.post("/extract", response_model=GraderResponse)
-@app.post("/answer-image", response_model=GraderResponse)
-async def process_any_invoice(request: Request):
+
+class ImageResponse(BaseModel):
+    answer: str
+
+
+def clean_answer(ans: str) -> str:
+    ans = ans.strip()
+
+    # remove markdown code fences
+    ans = re.sub(r"^```.*?\n", "", ans, flags=re.DOTALL)
+    ans = ans.replace("```", "")
+
+    # remove surrounding quotes
+    ans = ans.strip("\"'")
+    return ans.strip()
+
+
+@app.get("/")
+def home():
+    return {"status": "running"}
+
+
+@app.post("/answer-image", response_model=ImageResponse)
+def answer_image(req: ImageRequest):
+
     try:
-        # Capture incoming text dynamically from any data wrapper
-        invoice_content = ""
-        try:
-            payload = await request.json()
-            if isinstance(payload, dict):
-                if "invoice_text" in payload:
-                    invoice_content = str(payload["invoice_text"])
-                elif "text" in payload:
-                    invoice_content = str(payload["text"])
-                elif "image" in payload:
-                    invoice_content = str(payload["image"])
-                else:
-                    for val in payload.values():
-                        if isinstance(val, str) and len(val) > 5:
-                            invoice_content = val
-                            break
-                    if not invoice_content:
-                        invoice_content = json.dumps(payload)
-            else:
-                invoice_content = str(payload)
-        except Exception:
-            raw_body = await request.body()
-            invoice_content = raw_body.decode("utf-8", errors="ignore")
 
-        if not invoice_content.strip():
-            return GraderResponse(answer=InvoiceData())
+        image_data = req.image_base64.strip()
 
-        system_instruction = (
-            "You are an expert financial data extractor. Analyze the provided raw text data or "
-            "base64 content of an invoice and extract the requested fields. "
-            "Return your response strictly matching the requested JSON schema wrapper.\n"
-            "CRITICAL RULES:\n"
-            "1. The 'date' field MUST be converted into ISO format (YYYY-MM-DD).\n"
-            "2. The 'amount' field MUST be the subtotal BEFORE tax.\n"
-            "3. The 'tax' field is only the tax amount.\n"
-            "4. Convert currency symbols to standard 3-letter codes (e.g., Rs. or INR becomes 'INR')."
-        )
+        # add prefix if grader sends only raw base64
+        if not image_data.startswith("data:image"):
+            image_data = "data:image/png;base64," + image_data
 
-        # Force the model to output the nested structure directly
-        response = client.beta.chat.completions.parse(
-            model="llama-3.3-70b-versatile",
+        prompt = f"""
+You are an OCR and visual reasoning assistant.
+
+Answer ONLY the user's question.
+
+Question:
+{req.question}
+
+Rules:
+
+- Return ONLY the answer.
+- No explanation.
+- No sentences.
+- If numeric, return ONLY the number.
+- No commas unless present in the answer.
+- No currency symbols.
+- No units.
+- No markdown.
+"""
+
+        completion = client.chat.completions.create(
+
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+
+            temperature=0,
+
+            max_completion_tokens=128,
+
             messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": invoice_content}
+                {
+                    "role": "user",
+                    "content": [
+
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data
+                            },
+                        },
+                    ],
+                }
             ],
-            response_format=GraderResponse,
-            temperature=0.0,
         )
 
-        return response.choices[0].message.parsed
+        answer = completion.choices[0].message.content
+
+        if answer is None:
+            answer = ""
+
+        answer = clean_answer(answer)
+
+        return ImageResponse(answer=answer)
 
     except Exception as e:
-        print(f"Extraction processing exception: {str(e)}")
-        # Returns a structural fallback containing empty properties inside the 'answer' field
-        return GraderResponse(answer=InvoiceData())
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
