@@ -1,80 +1,62 @@
 import os
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from groq import Groq
+from pydantic import BaseModel, Field
+from openai import OpenAI  # Switched to OpenAI client to match the /v1 endpoint layout
 
-# 1. Initialize FastAPI app
 app = FastAPI()
 
-# 2. Enable CORS (Crucial so the IITM Cloudflare Worker grader doesn't block your API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows requests from any origin
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods (POST, GET, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 3. Initialize the Groq Client
-# It automatically picks up the GROQ_API_KEY environment variable
-client = Groq()
+# Force the client to read your specific dashboard environment variables
+client = OpenAI(
+    base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+    api_key=os.environ.get("ANTHROPIC_AUTH_TOKEN")
+)
 
-# 4. Define the exact request format required by the API specification
-class QAQuery(BaseModel):
-    image_base64: str
-    question: str
+class InvoiceRequest(BaseModel):
+    invoice_text: str
 
-@app.post("/answer-image")
-async def answer_image(query: QAQuery):
+class InvoiceResponse(BaseModel):
+    invoice_no: Optional[str] = Field(None, description="The invoice number/ID. Null if not found.")
+    date: Optional[str] = Field(None, description="The invoice date formatted strictly as YYYY-MM-DD. Null if not found.")
+    vendor: Optional[str] = Field(None, description="The name of the vendor/seller. Null if not found.")
+    amount: Optional[float] = Field(None, description="The subtotal amount BEFORE tax. Null if not found.")
+    tax: Optional[float] = Field(None, description="The tax amount only. Null if not found.")
+    currency: Optional[str] = Field(None, description="The 3-letter currency code (e.g., INR, USD). Null if not found.")
+
+@app.post("/extract")
+async def extract_invoice(payload: InvoiceRequest):
     try:
-        # Standardizing the base64 string format for the API data URL
-        base64_image = query.image_base64
-        if not base64_image.startswith("data:image"):
-            # Assuming it's a PNG based on the assignment description, but adjusting if needed
-            base64_image = f"data:image/png;base64,{base64_image}"
-
-        # 5. Call Groq's Vision Model
-        # We prompt the model to ONLY return the raw answer to avoid grading errors
-        system_prompt = (
-            "You are a precise data extraction assistant. Analyze the image and answer the user's question. "
-            "CRITICAL: If the answer is a number, return ONLY the raw numeric value (e.g., '4089.35'). "
-            "Do not include currency symbols ($ or ₹), units, spaces, punctuation, or conversational filler like 'The total is...'. "
-            "If it is a text answer, keep it brief and precise."
+        system_instruction = (
+            "You are an expert financial data extractor. Analyze the provided raw invoice text "
+            "and extract the requested fields. Return your answer strictly as a valid JSON object matching the requested schema.\n"
+            "CRITICAL RULES:\n"
+            "1. The 'date' field MUST be converted into ISO format (YYYY-MM-DD).\n"
+            "2. The 'amount' field MUST be the subtotal BEFORE tax.\n"
+            "3. The 'tax' field is only the tax amount.\n"
+            "4. Convert names to standard currency codes if applicable (e.g., Rs. or INR becomes 'INR')."
         )
 
-        response = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview", # High-speed multimodal model on Groq
+        # Using structured responses via standard chat completions 
+        response = client.beta.chat.completions.parse(
+            model="llama-3.3-70b-versatile",
             messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"{system_prompt}\n\nQuestion: {query.question}"},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": base64_image
-                            }
-                        }
-                    ]
-                }
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": payload.invoice_text}
             ],
-            temperature=0.0, # Keeps the model factual and deterministic
-            max_tokens=100
+            response_format=InvoiceResponse,
+            temperature=0.0,
         )
 
-        # 6. Extract raw text response
-        raw_answer = response.choices[0].message.content.strip()
-
-        # 7. Post-processing safety layer to prevent "image answers are incorrect" error
-        # Strips out common stray characters like currency symbols just in case
-        cleaned_answer = raw_answer.replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
-
-        return {"answer": str(cleaned_answer)}
+        return response.choices[0].message.parsed
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
