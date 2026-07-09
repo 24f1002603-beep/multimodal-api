@@ -1,85 +1,80 @@
 import os
-import re
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
+from groq import Groq
 
+# 1. Initialize FastAPI app
 app = FastAPI()
 
+# 2. Enable CORS (Crucial so the IITM Cloudflare Worker grader doesn't block your API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows requests from any origin
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all HTTP methods (POST, GET, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
-BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
-API_KEY = os.getenv("ANTHROPIC_AUTH_TOKEN")
+# 3. Initialize the Groq Client
+# It automatically picks up the GROQ_API_KEY environment variable
+client = Groq()
 
-client = OpenAI(
-    base_url=BASE_URL,
-    api_key=API_KEY
-)
-
-class QARequest(BaseModel):
+# 4. Define the exact request format required by the API specification
+class QAQuery(BaseModel):
     image_base64: str
     question: str
 
 @app.post("/answer-image")
-async def answer_image(payload: QARequest):
+async def answer_image(query: QAQuery):
     try:
-        b64_string = payload.image_base64
-        # Standardize the base64 URI formatting for the vision processor
-        if not b64_string.startswith("data:image"):
-            b64_string = f"data:image/png;base64,{b64_string}"
+        # Standardizing the base64 string format for the API data URL
+        base64_image = query.image_base64
+        if not base64_image.startswith("data:image"):
+            # Assuming it's a PNG based on the assignment description, but adjusting if needed
+            base64_image = f"data:image/png;base64,{base64_image}"
 
-        # Using meta-llama/llama-4-scout-17b-16e-instruct for multimodal vision capability
+        # 5. Call Groq's Vision Model
+        # We prompt the model to ONLY return the raw answer to avoid grading errors
+        system_prompt = (
+            "You are a precise data extraction assistant. Analyze the image and answer the user's question. "
+            "CRITICAL: If the answer is a number, return ONLY the raw numeric value (e.g., '4089.35'). "
+            "Do not include currency symbols ($ or ₹), units, spaces, punctuation, or conversational filler like 'The total is...'. "
+            "If it is a text answer, keep it brief and precise."
+        )
+
         response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="llama-3.2-11b-vision-preview", # High-speed multimodal model on Groq
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text", 
-                            "text": (
-                                f"{payload.question}\n\n"
-                                "CRITICAL RULE: Extract the exact value requested from the image. "
-                                "Output ONLY the final raw number or string answer. "
-                                "Do NOT include any currency symbols ($), units, commas, or explanatory text. "
-                                "Example format: 4089.35"
-                            )
-                        },
+                        {"type": "text", "text": f"{system_prompt}\n\nQuestion: {query.question}"},
                         {
                             "type": "image_url",
-                            "image_url": {"url": b64_string}
+                            "image_url": {
+                                "url": base64_image
+                            }
                         }
                     ]
                 }
             ],
-            max_tokens=30,
-            temperature=0.0  # Force maximum precision and consistency
+            temperature=0.0, # Keeps the model factual and deterministic
+            max_tokens=100
         )
-        
-        raw_answer = response.choices[0].message.content.strip()
-        
-        # --- Post-Processing Data Clean Up ---
-        cleaned = raw_answer.strip('"').strip("'").strip()
-        
-        # Strip currency symbols and formatting commas that violate Rule 1
-        if any(char.isdigit() for char in cleaned):
-            cleaned = re.sub(r'[$\s€£¥]', '', cleaned)
-            if ',' in cleaned and '.' in cleaned:
-                cleaned = cleaned.replace(',', '')
-            
-            # If the model still returned a full phrase, extract just the raw number sequence
-            match = re.search(r'\d+\.?\d*', cleaned)
-            if match:
-                cleaned = match.group(0)
 
-        return {"answer": str(cleaned)}
-        
+        # 6. Extract raw text response
+        raw_answer = response.choices[0].message.content.strip()
+
+        # 7. Post-processing safety layer to prevent "image answers are incorrect" error
+        # Strips out common stray characters like currency symbols just in case
+        cleaned_answer = raw_answer.replace("$", "").replace("¥", "").replace("€", "").replace("₹", "").strip()
+
+        return {"answer": str(cleaned_answer)}
+
     except Exception as e:
-        return {"answer": f"Error: {str(e)}"}
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
