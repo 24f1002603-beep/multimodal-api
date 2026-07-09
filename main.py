@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import OpenAI  # Switched to OpenAI client to match the /v1 endpoint layout
+from openai import OpenAI
 
 app = FastAPI()
 
@@ -15,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Force the client to read your specific dashboard environment variables
 client = OpenAI(
     base_url=os.environ.get("ANTHROPIC_BASE_URL"),
     api_key=os.environ.get("ANTHROPIC_AUTH_TOKEN")
@@ -32,8 +31,8 @@ class InvoiceResponse(BaseModel):
     tax: Optional[float] = Field(None, description="The tax amount only. Null if not found.")
     currency: Optional[str] = Field(None, description="The 3-letter currency code (e.g., INR, USD). Null if not found.")
 
-@app.post("/extract")
-async def extract_invoice(payload: InvoiceRequest):
+# Reusable function containing your logic
+async def process_invoice_extraction(payload: InvoiceRequest):
     try:
         system_instruction = (
             "You are an expert financial data extractor. Analyze the provided raw invoice text "
@@ -45,7 +44,6 @@ async def extract_invoice(payload: InvoiceRequest):
             "4. Convert names to standard currency codes if applicable (e.g., Rs. or INR becomes 'INR')."
         )
 
-        # Using structured responses via standard chat completions 
         response = client.beta.chat.completions.parse(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -60,3 +58,13 @@ async def extract_invoice(payload: InvoiceRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Match the route from your assignment specification
+@app.post("/extract", response_model=InvoiceResponse)
+async def extract_invoice(payload: InvoiceRequest):
+    return await process_invoice_extraction(payload)
+
+# Add this route to fix the 404 error showing in your logs!
+@app.post("/answer-image", response_model=InvoiceResponse)
+async def answer_image_invoice(payload: InvoiceRequest):
+    return await process_invoice_extraction(payload)
