@@ -1,12 +1,27 @@
 import os
 import re
-import requests
+import base64
+from io import BytesIO
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from PIL import Image
 
-app = FastAPI()
+from google import genai
+from google.genai import types
+
+# -----------------------------
+# Gemini Client
+# -----------------------------
+client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"]
+)
+
+# -----------------------------
+# FastAPI
+# -----------------------------
+app = FastAPI(title="Multimodal Image QA API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,10 +31,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.environ["ANTHROPIC_AUTH_TOKEN"]
-BASE_URL = os.environ["ANTHROPIC_BASE_URL"].rstrip("/")
-
-
+# -----------------------------
+# Models
+# -----------------------------
 class ImageRequest(BaseModel):
     image_base64: str
     question: str
@@ -29,6 +43,9 @@ class ImageResponse(BaseModel):
     answer: str
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def clean_answer(text: str) -> str:
     if text is None:
         return ""
@@ -37,80 +54,85 @@ def clean_answer(text: str) -> str:
 
     text = re.sub(r"^```.*?\n", "", text, flags=re.DOTALL)
     text = text.replace("```", "")
+    text = text.strip()
 
-    return text.strip("\"' ").strip()
+    if (
+        text.startswith('"')
+        and text.endswith('"')
+        and len(text) >= 2
+    ):
+        text = text[1:-1]
+
+    return text.strip()
 
 
+def decode_image(image_base64: str):
+
+    if "," in image_base64:
+        image_base64 = image_base64.split(",", 1)[1]
+
+    image_bytes = base64.b64decode(image_base64)
+
+    return Image.open(BytesIO(image_bytes))
+
+
+# -----------------------------
+# Root
+# -----------------------------
 @app.get("/")
-def root():
-    return {"status": "ok"}
+def home():
+    return {"status": "running"}
 
 
+# -----------------------------
+# Main Endpoint
+# -----------------------------
 @app.post("/answer-image", response_model=ImageResponse)
-def answer(req: ImageRequest):
+def answer_image(req: ImageRequest):
 
-    image = req.image_base64.strip()
+    try:
 
-    if not image.startswith("data:image"):
-        image = "data:image/png;base64," + image
+        image = decode_image(req.image_base64)
 
-    payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "temperature": 0,
-        "max_tokens": 128,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"""
-Answer ONLY the user's question.
+        prompt = f"""
+You are an expert OCR and visual reasoning model.
+
+Answer the user's question using ONLY the image.
 
 Question:
 {req.question}
 
-Rules:
-- Return only the answer.
-- No explanation.
-- If numeric, return only the number.
-- No currency symbols.
-- No units.
-- No markdown.
+IMPORTANT RULES
+
+1. Return ONLY the answer.
+2. No explanation.
+3. No markdown.
+4. No code block.
+5. No extra words.
+6. If numeric, return only the number.
+7. Remove currency symbols.
+8. Remove units.
+9. Keep dates exactly as shown unless asked otherwise.
 """
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image
-                        }
-                    }
-                ]
-            }
-        ]
-    }
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                prompt,
+                image
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0
+            )
+        )
 
-    r = requests.post(
-        f"{BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
+        answer = clean_answer(response.text)
 
-    # This is the important part.
-    # If Groq rejects the request you'll actually see WHY.
-    if r.status_code != 200:
-        print(r.status_code)
-        print(r.text)
-        raise HTTPException(r.status_code, r.text)
+        return ImageResponse(answer=answer)
 
-    data = r.json()
-
-    answer = data["choices"][0]["message"]["content"]
-
-    return ImageResponse(answer=clean_answer(answer))
+    except Exception as e:
+        print(e)
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
